@@ -1,8 +1,9 @@
 const express = require('express');
 const router = express.Router();
+const { supabase } = require('../lib/supabase');
 
-// Mock products data
-const products = [
+// Mock products data (fallback)
+const mockProducts = [
   {
     id: '1',
     name: 'iPhone 15 Pro Max',
@@ -94,36 +95,37 @@ const products = [
 ];
 
 // Get all products
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
   try {
     const { category, brand, minPrice, maxPrice, search, sort } = req.query;
 
-    let filtered = [...products];
+    // Get products from Supabase
+    let query = supabase.from('products').select('*');
 
-    // Filter by category
+    // Apply filters
     if (category) {
-      filtered = filtered.filter(p => p.category === category.toLowerCase());
+      query = query.eq('category', category.toLowerCase());
     }
-
-    // Filter by brand
     if (brand) {
-      filtered = filtered.filter(p => p.brand.toLowerCase() === brand.toLowerCase());
+      query = query.eq('brand', brand.toLowerCase());
     }
-
-    // Filter by price range
     if (minPrice) {
-      filtered = filtered.filter(p => p.price >= parseInt(minPrice));
+      query = query.gte('price', parseInt(minPrice));
     }
     if (maxPrice) {
-      filtered = filtered.filter(p => p.price <= parseInt(maxPrice));
+      query = query.lte('price', parseInt(maxPrice));
     }
+
+    const { data: products, error } = await query;
+
+    let filtered = products && !error ? products : mockProducts;
 
     // Search by name or description
     if (search) {
       const searchLower = search.toLowerCase();
       filtered = filtered.filter(p =>
         p.name.toLowerCase().includes(searchLower) ||
-        p.description.toLowerCase().includes(searchLower)
+        (p.description && p.description.toLowerCase().includes(searchLower))
       );
     }
 
@@ -133,7 +135,7 @@ router.get('/', (req, res) => {
     } else if (sort === 'price-desc') {
       filtered.sort((a, b) => b.price - a.price);
     } else if (sort === 'rating') {
-      filtered.sort((a, b) => b.rating - a.rating);
+      filtered.sort((a, b) => (b.rating || 0) - (a.rating || 0));
     } else if (sort === 'newest') {
       filtered.sort((a, b) => b.id - a.id);
     }
@@ -148,12 +150,21 @@ router.get('/', (req, res) => {
 });
 
 // Get single product
-router.get('/:id', (req, res) => {
+router.get('/:id', async (req, res) => {
   try {
-    const product = products.find(p => p.id === req.params.id);
+    const { data: product, error } = await supabase
+      .from('products')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
 
-    if (!product) {
-      return res.status(404).json({ error: 'Product not found' });
+    if (error || !product) {
+      // Fallback to mock data
+      const mockProduct = mockProducts.find(p => p.id === req.params.id);
+      if (!mockProduct) {
+        return res.status(404).json({ error: 'Product not found' });
+      }
+      return res.json(mockProduct);
     }
 
     res.json(product);
@@ -163,8 +174,17 @@ router.get('/:id', (req, res) => {
 });
 
 // Get categories
-router.get('/categories/list', (req, res) => {
+router.get('/categories/list', async (req, res) => {
   try {
+    const { data: products, error } = await supabase
+      .from('products')
+      .select('category');
+
+    if (error || !products) {
+      const categories = [...new Set(mockProducts.map(p => p.category))];
+      return res.json({ categories });
+    }
+
     const categories = [...new Set(products.map(p => p.category))];
     res.json({ categories });
   } catch (error) {
@@ -173,7 +193,7 @@ router.get('/categories/list', (req, res) => {
 });
 
 // Create product (admin only)
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   try {
     const { name, price, category, brand, stock, description } = req.body;
 
@@ -181,28 +201,34 @@ router.post('/', (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    const newProduct = {
-      id: Math.random().toString(36).substr(2, 9),
-      name,
-      price,
-      originalPrice: price,
-      category,
-      brand,
-      stock: stock || 0,
-      description: description || '',
-      image: 'https://via.placeholder.com/500',
-      rating: 0,
-      reviewCount: 0,
-      specifications: {},
-      tags: [],
-      variations: []
-    };
+    const { data: newProduct, error } = await supabase
+      .from('products')
+      .insert([
+        {
+          name,
+          price,
+          originalPrice: price,
+          category,
+          brand,
+          stock: stock || 0,
+          description: description || '',
+          image: 'https://via.placeholder.com/500',
+          rating: 0,
+          reviewCount: 0,
+          specifications: {},
+          tags: [],
+          variations: []
+        }
+      ])
+      .select();
 
-    products.push(newProduct);
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
 
     res.status(201).json({
       message: 'Product created successfully',
-      product: newProduct
+      product: newProduct[0]
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

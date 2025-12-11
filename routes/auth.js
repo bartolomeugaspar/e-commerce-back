@@ -2,9 +2,7 @@ const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-
-// Mock database
-const users = [];
+const { supabase, supabaseAdmin } = require('../lib/supabase');
 
 // Helper function to generate JWT
 const generateToken = (userId) => {
@@ -23,38 +21,46 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // Check if user exists
-    const existingUser = users.find(u => u.email === email);
-    if (existingUser) {
-      return res.status(400).json({ error: 'User already exists' });
+    // Create user in Supabase Auth
+    const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { name }
+    });
+
+    if (authError) {
+      return res.status(400).json({ error: authError.message });
     }
 
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
+    // Create user profile in database
+    const { data: profileData, error: profileError } = await supabase
+      .from('users')
+      .insert([
+        {
+          id: authData.user.id,
+          email,
+          name,
+          role: 'user'
+        }
+      ])
+      .select();
 
-    // Create user
-    const user = {
-      id: Math.random().toString(36).substr(2, 9),
-      email,
-      name,
-      password: hashedPassword,
-      role: 'user',
-      createdAt: new Date()
-    };
+    if (profileError) {
+      return res.status(400).json({ error: profileError.message });
+    }
 
-    users.push(user);
-
-    // Generate token
-    const token = generateToken(user.id);
+    // Generate JWT token
+    const token = generateToken(authData.user.id);
 
     res.status(201).json({
       message: 'User registered successfully',
       token,
       user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        role: user.role
+        id: authData.user.id,
+        email: authData.user.email,
+        name: name,
+        role: 'user'
       }
     });
   } catch (error) {
@@ -72,40 +78,69 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password required' });
     }
 
-    // Find user
-    let user = users.find(u => u.email === email);
+    // Authenticate with Supabase
+    const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+      email,
+      password
+    });
 
-    if (!user) {
-      // Create user if doesn't exist (for demo)
-      const hashedPassword = await bcrypt.hash(password, 10);
-      user = {
-        id: Math.random().toString(36).substr(2, 9),
+    if (authError) {
+      // User doesn't exist, create one (for demo)
+      const { data: newAuthData, error: createError } = await supabaseAdmin.auth.admin.createUser({
         email,
-        name: email.split('@')[0],
-        password: hashedPassword,
-        role: isAdmin ? 'admin' : 'user',
-        createdAt: new Date()
-      };
-      users.push(user);
-    } else {
-      // Verify password
-      const passwordMatch = await bcrypt.compare(password, user.password);
-      if (!passwordMatch) {
-        return res.status(401).json({ error: 'Invalid credentials' });
+        password,
+        email_confirm: true,
+        user_metadata: { name: email.split('@')[0] }
+      });
+
+      if (createError) {
+        return res.status(400).json({ error: createError.message });
       }
+
+      // Create user profile
+      const { data: profileData } = await supabase
+        .from('users')
+        .insert([
+          {
+            id: newAuthData.user.id,
+            email,
+            name: email.split('@')[0],
+            role: isAdmin ? 'admin' : 'user'
+          }
+        ])
+        .select();
+
+      const token = generateToken(newAuthData.user.id);
+
+      return res.json({
+        message: 'Login successful',
+        token,
+        user: {
+          id: newAuthData.user.id,
+          email: newAuthData.user.email,
+          name: email.split('@')[0],
+          role: isAdmin ? 'admin' : 'user'
+        }
+      });
     }
 
-    // Generate token
-    const token = generateToken(user.id);
+    // Get user profile
+    const { data: profileData } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', authData.user.id)
+      .single();
+
+    const token = generateToken(authData.user.id);
 
     res.json({
       message: 'Login successful',
       token,
       user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        role: user.role
+        id: authData.user.id,
+        email: authData.user.email,
+        name: profileData?.name || email.split('@')[0],
+        role: profileData?.role || 'user'
       }
     });
   } catch (error) {
@@ -116,23 +151,44 @@ router.post('/login', async (req, res) => {
 // Google OAuth
 router.post('/google', async (req, res) => {
   try {
-    const { token } = req.body;
+    const { email, name } = req.body;
 
-    // In production, verify token with Google
-    // For now, create/find user
-    const user = {
-      id: Math.random().toString(36).substr(2, 9),
-      email: `user-${Date.now()}@gmail.com`,
-      name: 'Google User',
-      role: 'user',
-      createdAt: new Date()
-    };
+    // Check if user exists
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
 
-    const jwtToken = generateToken(user.id);
+    let user = existingUser;
+
+    if (!user) {
+      // Create new user
+      const { data: newUser, error } = await supabase
+        .from('users')
+        .insert([
+          {
+            id: Math.random().toString(36).substr(2, 9),
+            email,
+            name: name || email.split('@')[0],
+            role: 'user'
+          }
+        ])
+        .select()
+        .single();
+
+      if (error) {
+        return res.status(400).json({ error: error.message });
+      }
+
+      user = newUser;
+    }
+
+    const token = generateToken(user.id);
 
     res.json({
       message: 'Google login successful',
-      token: jwtToken,
+      token,
       user: {
         id: user.id,
         email: user.email,
@@ -148,23 +204,44 @@ router.post('/google', async (req, res) => {
 // GitHub OAuth
 router.post('/github', async (req, res) => {
   try {
-    const { token } = req.body;
+    const { email, name } = req.body;
 
-    // In production, verify token with GitHub
-    // For now, create/find user
-    const user = {
-      id: Math.random().toString(36).substr(2, 9),
-      email: `user-${Date.now()}@github.com`,
-      name: 'GitHub User',
-      role: 'user',
-      createdAt: new Date()
-    };
+    // Check if user exists
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
 
-    const jwtToken = generateToken(user.id);
+    let user = existingUser;
+
+    if (!user) {
+      // Create new user
+      const { data: newUser, error } = await supabase
+        .from('users')
+        .insert([
+          {
+            id: Math.random().toString(36).substr(2, 9),
+            email,
+            name: name || email.split('@')[0],
+            role: 'user'
+          }
+        ])
+        .select()
+        .single();
+
+      if (error) {
+        return res.status(400).json({ error: error.message });
+      }
+
+      user = newUser;
+    }
+
+    const token = generateToken(user.id);
 
     res.json({
       message: 'GitHub login successful',
-      token: jwtToken,
+      token,
       user: {
         id: user.id,
         email: user.email,
